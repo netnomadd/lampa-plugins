@@ -7,8 +7,9 @@
     var PREFIX = 'post2mpv_';
     var DEFAULT_ADDRESS = '127.0.0.1:7531';
     var DEFAULT_HOTKEY = 'P';
-    var lastPlay = null;
     var lastHotkeyAt = 0;
+    var pendingSend = false;
+    var pendingTimer = null;
 
     function storageGet(name, def) {
         return Lampa.Storage.get(PREFIX + name, def);
@@ -119,17 +120,46 @@
         return url;
     }
 
-    function currentPlay() {
-        if (Lampa.Player && typeof Lampa.Player.playdata === 'function') {
-            var work = Lampa.Player.playdata();
-            if (work) return work;
-        }
+    function isWaitingPlay() {
+        try {
+            var name = Lampa.Controller && Lampa.Controller.enabled && Lampa.Controller.enabled().name;
+            if (name === 'loading') return true;
+        } catch (e) {}
 
-        return lastPlay;
+        return Boolean(document.querySelector('.media-loading--standalone, .loading-layer'));
     }
 
-    function remember(data) {
-        if (data) lastPlay = data;
+    function clearPendingSend() {
+        pendingSend = false;
+        if (pendingTimer) {
+            clearTimeout(pendingTimer);
+            pendingTimer = null;
+        }
+    }
+
+    function consumePendingSend() {
+        if (!pendingSend) return false;
+        clearPendingSend();
+        return true;
+    }
+
+    function schedulePendingExpire() {
+        if (pendingTimer) clearTimeout(pendingTimer);
+
+        pendingTimer = setTimeout(function () {
+            pendingTimer = null;
+            if (!pendingSend) return;
+            if (isWaitingPlay()) {
+                schedulePendingExpire();
+                return;
+            }
+            pendingSend = false;
+        }, 3000);
+    }
+
+    function armPendingSend() {
+        pendingSend = true;
+        schedulePendingExpire();
     }
 
     function sendToPost2Mpv(object) {
@@ -182,8 +212,19 @@
             });
     }
 
-    function sendCurrent() {
-        sendToPost2Mpv(currentPlay());
+    function activateFocused() {
+        var focused =
+            document.querySelector('.selector.focus') ||
+            document.querySelector('.selector.hover');
+
+        if (focused && window.$) {
+            $(focused).trigger('hover:enter');
+            return;
+        }
+
+        if (Lampa.Controller && typeof Lampa.Controller.enter === 'function') {
+            Lampa.Controller.enter();
+        }
     }
 
     function isTyping(e) {
@@ -214,45 +255,41 @@
 
         if (e.event && typeof e.event.preventDefault === 'function') e.event.preventDefault();
 
-        sendCurrent();
+        armPendingSend();
+        activateFocused();
     }
 
-    function onCreate(e) {
-        remember(e.data);
+    function interceptPlay(object) {
+        if (!isEnabled()) return false;
 
-        if (!isEnabled() || mode() !== 'play') return;
+        if (mode() === 'hotkey' && consumePendingSend()) {
+            sendToPost2Mpv(object);
+            return true;
+        }
 
-        sendToPost2Mpv(e.data);
+        if (mode() === 'play') {
+            sendToPost2Mpv(object);
+            return storageGet('skip_inner', true) !== false;
+        }
 
-        if (storageGet('skip_inner', true) && typeof e.abort === 'function') e.abort();
+        return false;
     }
 
     function hookPlayer() {
-        if (Lampa.Player && Lampa.Player.listener && typeof Lampa.Player.listener.follow === 'function') {
-            Lampa.Player.listener.follow('create', onCreate);
-            Lampa.Player.listener.follow('start', remember);
-            return;
-        }
-
         if (!Lampa.Player || typeof Lampa.Player.play !== 'function') return;
 
         var originalPlay = Lampa.Player.play.bind(Lampa.Player);
 
         Lampa.Player.play = function (object) {
-            remember(object);
-
-            if (isEnabled() && mode() === 'play') {
-                try {
-                    sendToPost2Mpv(object);
-                } catch (e) {
-                    console.log('post2mpv send error', e);
-                }
-
-                if (storageGet('skip_inner', true)) return;
-            }
-
+            if (interceptPlay(object)) return;
             return originalPlay(object);
         };
+
+        if (Lampa.Listener && typeof Lampa.Listener.follow === 'function') {
+            Lampa.Listener.follow('torrent_file', function (e) {
+                if (e && e.type === 'list_open') clearPendingSend();
+            });
+        }
     }
 
     function addSettings() {
@@ -273,7 +310,7 @@
             },
             field: {
                 name: 'Включено',
-                description: 'Если выключено, плагин не перехватывает воспроизведение и не реагирует на горячую клавишу'
+                description: 'Если выключено, плагин не перехватывает воспроизведение и не реагирует на горячую клавишу. Enter снова открывает обычный (в том числе внешний) плеер'
             }
         });
 
@@ -290,7 +327,7 @@
             },
             field: {
                 name: 'Режим отправки',
-                description: 'По умолчанию ссылка уходит в mpv только по горячей клавише. Встроенный плеер при этом работает как обычно'
+                description: 'Горячая клавиша: Enter/клик — обычный плеер, P на выбранной ссылке — только post2mpv. «При запуске» отправляет каждую выбранную ссылку'
             }
         });
 
@@ -311,7 +348,7 @@
             },
             field: {
                 name: 'Горячая клавиша',
-                description: 'Отправить текущую ссылку в post2mpv. Не занимает F/S/M из lampa-desktop'
+                description: 'Наведите на файл/озвучку и нажмите клавишу: ссылка уйдёт в post2mpv, внешний плеер не откроется. Не занимает F/S/M из lampa-desktop'
             }
         });
 
@@ -324,7 +361,7 @@
             },
             field: {
                 name: 'Не открывать встроенный плеер',
-                description: 'Только для режима «При запуске плеера»: ссылка уходит в mpv, внутренний плеер Lampa не запускается'
+                description: 'Только для режима «При запуске плеера»: не открывать ни встроенный, ни внешний плеер Lampa'
             }
         });
 
